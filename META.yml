@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               Dancer-Plugin-DebugToolbar
-version:            0.01
+version:            0.011
 abstract:           A debugging toolbar for Dancer web applications
 author:
     - Michal Wojciechowski <odyniec@cpan.org>
@@ -15,6 +15,7 @@ requires:
     File::ShareDir:       1
     File::ShareDir::Install:  0
     Test::More:           0
+    Tie::Hash::Indexed:   0
 no_index:
     directory:
         - t
