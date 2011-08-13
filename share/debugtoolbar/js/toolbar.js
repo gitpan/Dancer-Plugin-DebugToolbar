@@ -184,7 +184,7 @@ function DebugToolbar(cfg) {
             /* Show the information window */
             
             var top = $toolbarFrame.offset().top - 
-                $(parent.document.window).scrollTop() +
+                $(parent.document).scrollTop() +
                 $toolbarFrame.outerHeight() + 5;
             
             $windowFrame.hide();
@@ -390,6 +390,8 @@ var DataStructurePerlWidget = DataStructureWidget.extend({
         switch (item['type']) {
         case 'perl/undefined':
             return $('<div class="value value-undefined">undefined</div>');
+        case 'perl/cyclic-ref':
+            return $('<div class="value value-empty">cyclic reference</div>');
         default:
             return this._super(item);
         }
