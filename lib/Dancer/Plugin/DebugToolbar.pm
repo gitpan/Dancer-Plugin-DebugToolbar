@@ -19,18 +19,19 @@ use Scalar::Util qw(blessed looks_like_number refaddr);
 use Tie::Hash::Indexed;
 use Time::HiRes qw(time);
 
-our $VERSION = '0.015';
+our $VERSION = '0.016';
 
 # Distribution-level shared data directory
 my $dist_dir = File::ShareDir::dist_dir('Dancer-Plugin-DebugToolbar');
 
 # Information to be displayed to the user
-my $time_start;
+my %time_start;
+my $views;
 my $dbi_trace;
 my $dbi_queries;
 
 my $route_pattern;
-my $hook_registered;
+my $filter_registered;
 
 my $settings = plugin_setting;
 
@@ -89,6 +90,8 @@ sub _wrap_data {
                 $ret->{'value'}->{$i++} = _wrap_data($item, $options,
                     $parent_refs);
             }
+            
+            delete $parent_refs->{refaddr($var)};
         }
         else {
             # Cyclic reference
@@ -122,6 +125,8 @@ sub _wrap_data {
             else {
                 $ret->{'short_value'} = 'HASH';
             }
+            
+            delete $parent_refs->{refaddr($var)};
         }
         else {
             # Cyclic reference
@@ -150,23 +155,81 @@ sub _wrap_data {
     return $ret;
 }
 
-before sub {
-    $time_start = time;
+{
+    my $original = {};
+
+    no strict 'refs';
     
+    # Override the render method of all loaded Dancer::Template::* modules
+    foreach my $module (keys %INC) {
+        if ($module =~ m{^Dancer/Template/}) {
+            $module =~ s{/}{::}g;
+            $module =~ s/\.pm$//;
+
+            # Save the original render method
+            $original->{$module . '::render'} = \&{$module . '::render'};
+            
+            *{$module . '::render'} = sub {
+                my ($self, $template, $tokens) = @_;
+                
+                if (ref $template) {
+                    # $template is a reference to a string with the template
+                    # contents
+                    # TODO: Consider getting a substring of template contents
+                    $template = 'REF';
+                }
+                elsif (index($template, setting('views')) == 0) {
+                    # If $template is a file under the application's views
+                    # directory, strip off the directory
+                    $template = substr($template, length(setting('views')));
+                    $template =~ s{^/}{};
+                }
+                
+                # Strip off "Dancer::Template::" to get just the name of the
+                # template engine
+                (my $engine = blessed($self)) =~ s{.*::}{};
+                
+                push(@$views, {
+                    'template' => $template,
+                    'engine' => $engine,
+                    'tokens' => _wrap_data($tokens, { sort_keys => 1 })
+                });
+                
+                return &{$original->{blessed($self) . '::render'}}(@_);
+            };
+        }
+    }
+}
+
+before sub {
+    return if request->path_info =~ $route_pattern;
+    
+    my $request_id = request->path_info . time;
+    request->{_debug}->{id} = $request_id;
+    
+    $time_start{$request_id} = time;
+    
+    # Clear collected views data
+    $views = [];
+
     if ($settings->{show}->{database}) {
         Dancer::Plugin::DebugToolbar::DBI::reset();
     }
 };
 
-my $after_hook = sub {
+my $after_filter = sub {
     my $response = shift;
     my $content = $response->content;
     my $status = $response->status;
     
     return if $status < 200 || $status == 204 || $status == 304;
     return if $response->content_type !~ m!^(?:text/html|application/xhtml\+xml)!;
+    return if request->path_info =~ $route_pattern;
     
-	my $time_elapsed = time - $time_start;
+    my $request_id = request->{_debug}->{id};
+    return if !$request_id;
+    
+	my $time_elapsed = time - $time_start{$request_id};
     
     #
     # Get routes
@@ -176,37 +239,39 @@ my $after_hook = sub {
     my $all_routes = {};
     my $matching_routes = {};
     
-    foreach my $type (keys %$routes) {
-        $all_routes->{uc $type} = [];
-        $matching_routes->{uc $type} = [];
+    foreach my $method (keys %$routes) {
+        $all_routes->{uc $method} = [];
+        $matching_routes->{uc $method} = [];
         
-        foreach my $route (@{$routes->{$type}}) {
+        foreach my $route (@{$routes->{$method}}) {
             # Exclude our own route used to access the toolbar JS/CSS files
             next if ($route->{'pattern'} eq $route_pattern);
             
             my $route_info = {};
             my $route_data = _ordered_hash(
-                'Pattern' => $route->{'pattern'},
-                'Compiled regexp' => $route->{'_compiled_regexp'}
+                'Pattern' => qq{$route->{'pattern'}},
+                'Compiled regexp' => qq{$route->{'_compiled_regexp'}}
             );
             
             # Is this a matching route?
-            if (request->path_info =~ $route->{'_compiled_regexp'}) {
+            if (lc request->method eq $method && request->path_info =~
+                    $route->{'_compiled_regexp'})
+            {
                 $route_data->{'Match data'} = $route->match_data;
             }
             
             $route_info = {
-                'pattern' => $route->{'pattern'},
-                'matching' => defined $route_data->{'Match data'},
+                'pattern' => qq{$route->{'pattern'}},
+                'matching' => exists $route_data->{'Match data'},
                 'data' => _wrap_data($route_data)
             };
 
             # Add the route to the list of all routes
-            push(@{$all_routes->{uc $type}}, $route_info);
+            push(@{$all_routes->{uc $method}}, $route_info);
 
             if ($route_info->{matching}) {
                 # Add the route to the list of matching routes
-                push(@{$matching_routes->{uc $type}}, $route_info);
+                push(@{$matching_routes->{uc $method}}, $route_info);
             }
         }
     }
@@ -246,6 +311,9 @@ my $after_hook = sub {
                 } : undef,
                 'routes' => $show->{'routes'} ? {
                     'text' => 'routes'  
+                } : undef,
+                'templates' => $show->{'templates'} ? {
+                    'text' => 'templates'
                 } : undef,
                 'database' => $show->{'database'} ? {
                     'text' => 'database'
@@ -290,6 +358,16 @@ my $after_hook = sub {
                     'matching' => {
                         'type' => 'routes',
                         'routes' => $matching_routes
+                    }
+                )
+            },
+            # Templates
+            'templates' => {
+                'title' => 'Templates',
+                'pages' => _ordered_hash(
+                    'templates' => {
+                        'type' => 'templates',
+                        'views' => $views
                     }
                 )
             },
@@ -339,11 +417,11 @@ my $after_hook = sub {
 };
 
 after sub {
-    # Try to get the $after_hook sub executed as the very last hook (after all
-    # the other hooks defined in the application)
-    return if $hook_registered;
-    after $after_hook;
-    $hook_registered = 1;
+    # Try to get the $after_filter sub executed as the very last filter (after
+    # all the other filters defined in the application)
+    return if $filter_registered;
+    after $after_filter;
+    $filter_registered = 1;
 };
 
 $route_pattern = qr(^$path_prefix/.*);
@@ -364,7 +442,7 @@ __END__
 
 =head1 VERSION
 
-Version 0.015
+Version 0.016
 
 =head1 SYNOPSIS
 
@@ -434,6 +512,11 @@ C<session>, and C<vars> data structures.
 
 Database information screen. Shows L<DBI> trace and queries log.
 
+=item * templates
+
+Templates screen. Displays the names of rendered templates and lets you inspect
+the data that was passed to them.
+
 =item * routes
 
 Routes screen. Shows all the routes defined in the application, and indicates
@@ -494,6 +577,11 @@ L<http://cpanratings.perl.org/d/Dancer-Plugin-DebugToolbar>
 L<http://search.cpan.org/dist/Dancer-Plugin-DebugToolbar/>
 
 =back
+
+
+=head1 ACKNOWLEDGEMENTS
+
+Uses icons from the Fugue Icons set (L<http://p.yusukekamiyamane.com/>).
 
 
 =head1 LICENSE AND COPYRIGHT
